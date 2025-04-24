@@ -1,0 +1,267 @@
+import asyncio
+import json
+import os
+from concurrent.futures import ThreadPoolExecutor
+from typing import Optional, List, Tuple
+
+import curl_cffi
+import pyuseragents
+from curl_cffi import requests
+from loguru import logger
+
+# 设置 Schannel 作为 SSL 后端以解决 Windows 证书问题
+curl_cffi.requests.Session().curl_options["CURLOPT_SSL_BACKEND"] = "schannel"
+
+# 配置日志
+logger.add("faucet.log", rotation="10 MB", level="DEBUG", encoding="utf-8")
+
+
+class CaptchaSolver:
+    def __init__(self, capsolver_api: str, proxy: Optional[str] = None):
+        self.api_key = capsolver_api
+        self.proxy = proxy
+
+    async def solve_turnstile(self, page_url: str, sitekey: str) -> Optional[str]:
+        try:
+            async with requests.AsyncSession() as session:
+                if self.proxy:
+                    session.proxies = {"http": self.proxy, "https": self.proxy}
+                payload = {
+                    "clientKey": self.api_key,
+                    "task": {
+                        "type": "AntiTurnstileTaskProxyLess",
+                        "websiteURL": page_url,
+                        "websiteKey": sitekey
+                    }
+                }
+                logger.debug(f"发送验证码创建任务请求: {payload}")
+                response = await session.post(
+                    "https://api.capsolver.com/createTask",
+                    json=payload,
+                    verify=False  # 临时禁用证书验证
+                )
+                result = response.json()
+                logger.debug(f"验证码任务创建响应: {result}")
+                if result.get("errorId") == 0:
+                    task_id = result.get("taskId")
+                    if not task_id:
+                        logger.error("未获取到任务 ID")
+                        return None
+                    logger.debug(f"获取到任务 ID: {task_id}")
+                    while True:
+                        await asyncio.sleep(5)
+                        status_response = await session.post(
+                            "https://api.capsolver.com/getTaskResult",
+                            json={"clientKey": self.api_key, "taskId": task_id},
+                            verify=False
+                        )
+                        status_result = status_response.json()
+                        logger.debug(f"验证码任务状态响应: {status_result}")
+                        if status_result.get("status") == "ready":
+                            token = status_result.get("solution", {}).get("token")
+                            if token:
+                                logger.success(f"验证码 token 获取成功: {token[:20]}...")
+                                return token
+                            logger.error("验证码 solution 中缺少 token")
+                            return None
+                        if status_result.get("status") == "failed":
+                            logger.error("验证码任务失败")
+                            return None
+                        await asyncio.sleep(2)
+                else:
+                    logger.error(f"验证码任务创建失败: {result.get('errorDescription', '未知错误')}")
+                    return None
+        except Exception as e:
+            logger.error(f"验证码解析异常: {str(e)}")
+            return None
+
+
+class Faucet:
+    def __init__(self, wallet_address: str, capsolver_api: str, proxy: Optional[str] = None):
+        self.wallet_address = wallet_address
+        self.captcha_solver = CaptchaSolver(capsolver_api, proxy)
+        self.proxy = proxy
+
+    def __str__(self) -> str:
+        return f"[{self.wallet_address}] | 代理: {self.proxy or '无'} | 正在从水龙头请求代币..."
+
+    async def request_tokens(self) -> Optional[bool]:
+        logger.debug(f"为 {self.wallet_address} 解决 Cloudflare 验证码...")
+        captcha_token = await self.captcha_solver.solve_turnstile(
+            page_url="https://faucet.sui.io/",
+            sitekey="0x4AAAAAAA11HKyGNZq_dUKj"
+        )
+        if not captcha_token:
+            logger.error(f"[{self.wallet_address}] | 验证码 token 获取失败")
+            return False
+        logger.success(f"为 {self.wallet_address} 成功解决 Cloudflare 验证码")
+
+        headers = {
+            "accept": "*/*",
+            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "content-type": "application/json",
+            "origin": "https://faucet.sui.io",
+            "priority": "u=1, i",
+            "sec-ch-ua": '"Google Chrome";v="135", "Not-A.Brand";v="8", "Chromium";v="135"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-site",
+            "user-agent": pyuseragents.random(),
+            "x-turnstile-token": captcha_token,
+        }
+
+        json_data = {
+            "FixedAmountRequest": {
+                "recipient": str(self.wallet_address),
+            },
+        }
+
+        try:
+            async with requests.AsyncSession() as session:
+                if self.proxy:
+                    session.proxies = {"http": self.proxy, "https": self.proxy}
+                logger.debug(f"发送水龙头请求: {json_data}")
+                response = await session.post(
+                    "https://faucet.testnet.sui.io/v2/faucet_web_gas",
+                    headers=headers,
+                    json=json_data,
+                    verify=False
+                )
+                logger.debug(f"水龙头响应状态码: {response.status_code}")
+                if response.status_code == 200:
+                    logger.success(f"[{self.wallet_address}] | 成功请求测试网 SUI 代币！")
+                    return True
+                elif response.status_code == 429:
+                    logger.warning(f"[{self.wallet_address}] | 已请求过代币，请等待冷却时间。")
+                    return False
+                else:
+                    logger.error(f"[{self.wallet_address}] | 未知错误 | 状态码: {response.status_code}")
+                    try:
+                        response_json = response.json()
+                        logger.error(f"水龙头错误详情: {response_json}")
+                    except:
+                        logger.error("无法解析水龙头响应内容")
+                    return False
+        except Exception as e:
+            logger.error(f"[{self.wallet_address}] | 请求失败: {str(e)}")
+            return False
+
+
+def load_config() -> Tuple[str, List[str], List[str]]:
+    """读取配置文件和地址、代理文件"""
+    try:
+        with open("config.json", "r", encoding="utf-8") as f:
+            config = json.load(f)
+        capsolver_api = config.get("capsolver_api", "")
+        if not capsolver_api:
+            logger.error("config.json 中缺少 capsolver_api")
+            return "", [], []
+
+        # 读取钱包地址
+        wallets = []
+        try:
+            with open("wallets.txt", "r", encoding="utf-8") as f:
+                wallets = [line.strip() for line in f if line.strip()]
+            if not wallets:
+                logger.error("wallets.txt 为空")
+                return capsolver_api, [], []
+            logger.info(f"读取到 {len(wallets)} 个钱包地址")
+        except FileNotFoundError:
+            logger.error("wallets.txt 文件不存在")
+            return capsolver_api, [], []
+
+        # 读取代理 IP
+        proxies = []
+        try:
+            with open("proxies.txt", "r", encoding="utf-8") as f:
+                proxies = [line.strip() for line in f if line.strip()]
+            if not proxies:
+                logger.warning("proxies.txt 为空，将不使用代理")
+            else:
+                logger.info(f"读取到 {len(proxies)} 个代理 IP")
+        except FileNotFoundError:
+            logger.warning("proxies.txt 文件不存在，将不使用代理")
+
+        return capsolver_api, wallets, proxies
+    except Exception as e:
+        logger.error(f"读取配置失败: {str(e)}")
+        return "", [], []
+
+
+def save_failed_wallets(failed_wallets: List[Tuple[str, str]]):
+    """将最终失败的钱包地址保存到 failed_wallets.txt"""
+    if not failed_wallets:
+        logger.info("没有失败的钱包地址需要保存")
+        return
+    try:
+        with open("failed_wallets.txt", "w", encoding="utf-8") as f:
+            for wallet, proxy in failed_wallets:
+                f.write(f"{wallet} | 代理: {proxy or '无'}\n")
+        logger.info(f"已将 {len(failed_wallets)} 个失败的钱包地址保存到 failed_wallets.txt")
+    except Exception as e:
+        logger.error(f"保存失败的钱包地址失败: {str(e)}")
+
+
+async def process_wallet(wallet: str, capsolver_api: str, proxy: Optional[str], max_retries: int = 2) -> bool:
+    """处理单个钱包的领水任务，包含重试逻辑"""
+    for attempt in range(max_retries + 1):
+        logger.info(f"[{wallet}] | 尝试 {attempt + 1}/{max_retries + 1}")
+        faucet = Faucet(wallet, capsolver_api, proxy)
+        print(faucet)
+        result = await faucet.request_tokens()
+        if result:
+            return True
+        logger.warning(f"[{wallet}] | 第 {attempt + 1} 次尝试失败")
+        if attempt < max_retries:
+            await asyncio.sleep(2)  # 重试前等待 2 秒
+    return False
+
+
+async def main():
+    # 读取配置
+    capsolver_api, wallets, proxies = load_config()
+    if not capsolver_api or not wallets:
+        logger.error("无法继续：缺少必要配置")
+        return
+
+    # 确保代理数量足够（不足时循环使用）
+    if not proxies:
+        proxies = [None] * len(wallets)  # 无代理时使用 None
+    elif len(proxies) < len(wallets):
+        logger.warning(f"代理数量 ({len(proxies)}) 小于钱包数量 ({len(wallets)})，将循环使用代理")
+        proxies = (proxies * (len(wallets) // len(proxies) + 1))[:len(wallets)]
+    else:
+        proxies = proxies[:len(wallets)]
+
+    # 存储失败的钱包地址和对应的代理
+    failed_wallets = []
+    max_threads = 3  # 限制最大线程数为 3
+
+    # 创建线程池
+    with ThreadPoolExecutor(max_workers=max_threads) as executor:
+        # 处理所有钱包
+        tasks = [
+            process_wallet(wallet, capsolver_api, proxy)
+            for wallet, proxy in zip(wallets, proxies)
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 收集失败的钱包
+        for wallet, proxy, result in zip(wallets, proxies, results):
+            if result is not True:
+                failed_wallets.append((wallet, proxy))
+
+    # 保存失败的钱包地址
+    save_failed_wallets(failed_wallets)
+
+    # 统计结果
+    success_count = sum(1 for r in results if r is True)
+    logger.info(f"处理完成：{success_count}/{len(wallets)} 个钱包成功领取 SUI 代币")
+    if failed_wallets:
+        logger.warning(f"{len(failed_wallets)} 个钱包最终失败，已保存到 failed_wallets.txt")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
